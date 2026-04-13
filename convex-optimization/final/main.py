@@ -114,71 +114,76 @@ class PortfolioChallengeModel:
     def fit(self, x_train, r_train,
             lambda_linear=1.0, lambda_special=1.0,
             poly_lambda=None,
+            full_data=False,
             verbose=True):
         return self._fit(x_train, r_train,
                          lambda_linear=lambda_linear,
                          lambda_special=lambda_special,
                          poly_lambda=poly_lambda,
+                         full_data=full_data,
                          verbose=verbose)
 
     def _fit(self, x_train, r_train,
                    lambda_linear=1.0, lambda_special=1.0,
                    poly_lambda=None,
+                   full_data=False,
                    verbose=True):
         X = x_train[self.feature_cols].to_numpy(dtype=float)
         y = r_train[self.asset_cols].to_numpy(dtype=float)
 
-        n = X.shape[0]
-        split = max(1, int(0.9 * n))
-        X_tr, y_tr = X[:split], y[:split]
-        X_va, y_va = X[split:], y[split:]
+        if full_data:
+            X_tr, y_tr = X, y
+            X_va, y_va = None, None
+        else:
+            n = X.shape[0]
+            split = max(1, int(0.9 * n))
+            X_tr, y_tr = X[:split], y[:split]
+            X_va, y_va = X[split:], y[split:]
 
         self.x_mean = X_tr.mean(axis=0, keepdims=True)
         self.x_std  = X_tr.std(axis=0, keepdims=True) + 1e-8
         X_tr_n = (X_tr - self.x_mean) / self.x_std
-        X_va_n = (X_va - self.x_mean) / self.x_std
+        X_va_n = None if full_data else (X_va - self.x_mean) / self.x_std
 
         self.y_mean = y_tr.mean(axis=0, keepdims=True)
         self.y_std  = y_tr.std(axis=0, keepdims=True) + 1e-8
-        y_tr_n = np.clip((y_tr - self.y_mean) / self.y_std, -5.0, 5.0)
+        y_tr_n = (y_tr - self.y_mean) / self.y_std
 
         def _indices(names):
             return [i for i, col in enumerate(self.asset_cols) if col in names]
 
-        self.linear_indices  = _indices(LINEAR_ASSETS)
-        self.mixed_indices   = _indices(MIXED_ASSETS)
+        self.linear_indices = _indices(LINEAR_ASSETS)
+        self.mixed_indices = _indices(MIXED_ASSETS)
         self.special_indices = _indices(SPECIAL_ASSETS)
-        self.noise_indices   = _indices(NOISE_ASSETS)
+        self.noise_indices  = _indices(NOISE_ASSETS)
 
         d = X_tr_n.shape[1]
         A = X_tr_n.T @ X_tr_n + lambda_linear * np.eye(d)
         self.W_linear = np.linalg.solve(A, X_tr_n.T @ y_tr_n[:, self.linear_indices])
 
-        if verbose:
+        if verbose and not full_data:
             pred_va_lin = X_va_n @ self.W_linear
-            y_va_lin_n  = (y_va[:, self.linear_indices] - self.y_mean[:, self.linear_indices]) / self.y_std[:, self.linear_indices]
+            y_va_lin_n = (y_va[:, self.linear_indices] - self.y_mean[:, self.linear_indices]) / self.y_std[:, self.linear_indices]
             mse_lin = np.mean((pred_va_lin - y_va_lin_n) ** 2)
             print(f"[Linear   ] closed-form Ridge done — val MSE (norm): {mse_lin:.6f}")
 
         self.poly = Polynomial()
-        X_tr_poly   = self.poly.fit_transform(X_tr_n)
-        X_va_poly   = self.poly.transform(X_va_n)
+        X_tr_poly = self.poly.fit_transform(X_tr_n)
 
         self.poly_mean = X_tr_poly.mean(axis=0, keepdims=True)
-        self.poly_std  = X_tr_poly.std(axis=0, keepdims=True) + 1e-8
+        self.poly_std = X_tr_poly.std(axis=0, keepdims=True) + 1e-8
         X_tr_poly_n = np.clip((X_tr_poly - self.poly_mean) / self.poly_std, -5.0, 5.0)
-        X_va_poly_n = np.clip((X_va_poly - self.poly_mean) / self.poly_std, -5.0, 5.0)
 
         y_tr_mixed = y_tr_n[:, self.mixed_indices]
-        y_va_mix_n = np.clip(
-            (y_va[:, self.mixed_indices] - self.y_mean[:, self.mixed_indices]) / self.y_std[:, self.mixed_indices],
-            -5.0, 5.0,
-        )
 
         d_poly = X_tr_poly_n.shape[1]
         if poly_lambda is not None:
             best_lambda_mix = poly_lambda
         else:
+            if full_data:
+                raise ValueError("poly_lambda must be provided when full_data=True")
+            X_va_poly_n = np.clip((self.poly.transform(X_va_n) - self.poly_mean) / self.poly_std, -5.0, 5.0)
+            y_va_mix_n = (y_va[:, self.mixed_indices] - self.y_mean[:, self.mixed_indices]) / self.y_std[:, self.mixed_indices]
             best_lambda_mix, best_mse_mix = 1.0, np.inf
             for lam in [0.1, 1.0, 10.0, 100.0, 1000.0, 5000.0, 10000.0]:
                 _m = PolynomialRidge(lambda_reg=lam)
@@ -190,20 +195,22 @@ class PortfolioChallengeModel:
         self.mixed_model = PolynomialRidge(lambda_reg=best_lambda_mix)
         self.mixed_model.fit(X_tr_poly_n, y_tr_mixed)
 
-        if verbose:
+        if verbose and not full_data:
+            X_va_poly_n = np.clip((self.poly.transform(X_va_n) - self.poly_mean) / self.poly_std, -5.0, 5.0)
             pred_va_mix = self.mixed_model.predict(X_va_poly_n)
+            y_va_mix_n = (y_va[:, self.mixed_indices] - self.y_mean[:, self.mixed_indices]) / self.y_std[:, self.mixed_indices]
             mse_mix = float(np.mean((pred_va_mix - y_va_mix_n) ** 2))
             print(f"[Mixed    ] poly Ridge done (dim={d_poly}, λ={best_lambda_mix}) — val MSE (norm): {mse_mix:.6f}")
 
         y_tr_special = y_tr_n[:, self.special_indices]
-        y_va_spe_n   = (y_va[:, self.special_indices] - self.y_mean[:, self.special_indices]) / self.y_std[:, self.special_indices]
 
         d = X_tr_n.shape[1]
         A_spe = X_tr_n.T @ X_tr_n + lambda_special * np.eye(d)
         self.W_special = np.linalg.solve(A_spe, X_tr_n.T @ y_tr_special)
 
-        if verbose:
+        if verbose and not full_data:
             pred_va_spe = X_va_n @ self.W_special
+            y_va_spe_n = (y_va[:, self.special_indices] - self.y_mean[:, self.special_indices]) / self.y_std[:, self.special_indices]
             mse_spe = np.mean((pred_va_spe - y_va_spe_n) ** 2)
             print(f"[Special  ] Ridge done (feat dim={d}) — val MSE (norm): {mse_spe:.6f}")
 
@@ -218,16 +225,11 @@ class PortfolioChallengeModel:
         def _mse(pred_n, y_n):
             return float(np.mean((pred_n - y_n) ** 2))
 
-        lin_tr_n = X_tr_n @ self.W_linear
-        lin_va_n = X_va_n @ self.W_linear
-        mix_tr_n = self.mixed_model.predict(X_tr_poly_n)
-        mix_va_n = self.mixed_model.predict(X_va_poly_n)
-        spe_tr_n = X_tr_n @ self.W_special
-        spe_va_n = X_va_n @ self.W_special
-
         y_tr_lin_n = y_tr_n[:, self.linear_indices]
         y_tr_spe_n = y_tr_n[:, self.special_indices]
-        y_va_lin_n = (y_va[:, self.linear_indices] - self.y_mean[:, self.linear_indices]) / self.y_std[:, self.linear_indices]
+        lin_tr_n = X_tr_n @ self.W_linear
+        mix_tr_n = self.mixed_model.predict(X_tr_poly_n)
+        spe_tr_n = X_tr_n @ self.W_special
 
         def _portfolio_sharpe(pred_returns: np.ndarray, y_raw: np.ndarray) -> float:
             weights = (MVO_LAMBDA * (self.Sigma_inv @ pred_returns.T)).T
@@ -246,7 +248,6 @@ class PortfolioChallengeModel:
             return p
 
         full_pred_tr = _full_pred_n(lin_tr_n, mix_tr_n, spe_tr_n, len(X_tr)) * self.y_std + self.y_mean
-        full_pred_va = _full_pred_n(lin_va_n, mix_va_n, spe_va_n, len(X_va)) * self.y_std + self.y_mean
 
         self._fit_history = {
             "train": {
@@ -255,28 +256,47 @@ class PortfolioChallengeModel:
                 "mse_special": _mse(spe_tr_n, y_tr_spe_n),
                 "sharpe": _portfolio_sharpe(full_pred_tr, y_tr),
             },
-            "val": {
+            "_train_pred":    full_pred_tr,
+            "_train_returns": y_tr,
+        }
+
+        if not full_data:
+            X_va_poly_n = np.clip((self.poly.transform(X_va_n) - self.poly_mean) / self.poly_std, -5.0, 5.0)
+            lin_va_n = X_va_n @ self.W_linear
+            mix_va_n = self.mixed_model.predict(X_va_poly_n)
+            spe_va_n = X_va_n @ self.W_special
+            y_va_lin_n = (y_va[:, self.linear_indices] - self.y_mean[:, self.linear_indices]) / self.y_std[:, self.linear_indices]
+            y_va_mix_n = (y_va[:, self.mixed_indices] - self.y_mean[:, self.mixed_indices]) / self.y_std[:, self.mixed_indices]
+            y_va_spe_n = (y_va[:, self.special_indices] - self.y_mean[:, self.special_indices]) / self.y_std[:, self.special_indices]
+            full_pred_va = _full_pred_n(lin_va_n, mix_va_n, spe_va_n, len(X_va)) * self.y_std + self.y_mean
+            self._fit_history["val"] = {
                 "mse_linear": _mse(lin_va_n, y_va_lin_n),
                 "mse_mixed": _mse(mix_va_n, y_va_mix_n),
                 "mse_special": _mse(spe_va_n, y_va_spe_n),
                 "sharpe": _portfolio_sharpe(full_pred_va, y_va),
-            },
-            "_val_pred": full_pred_va,
-            "_val_returns": y_va,
-            "_train_pred": full_pred_tr,
-            "_train_returns": y_tr,
-        }
+            }
+            self._fit_history["_val_pred"] = full_pred_va
+            self._fit_history["_val_returns"] = y_va
 
         if verbose:
             h = self._fit_history
             print(f"\n{'─'*60}")
-            print(f"{'Group':<12} {'Train MSE':>10} {'Val MSE':>10}")
-            print(f"{'─'*60}")
-            print(f"{'Linear':<12} {h['train']['mse_linear']:>10.6f} {h['val']['mse_linear']:>10.6f}")
-            print(f"{'Mixed':<12} {h['train']['mse_mixed']:>10.6f} {h['val']['mse_mixed']:>10.6f}")
-            print(f"{'Special':<12} {h['train']['mse_special']:>10.6f} {h['val']['mse_special']:>10.6f}")
-            print(f"{'─'*60}")
-            print(f"Portfolio Sharpe (ann.)  train={h['train']['sharpe']:+.4f}  val={h['val']['sharpe']:+.4f}")
+            if full_data:
+                print(f"{'Group':<12} {'Train MSE':>10}")
+                print(f"{'─'*60}")
+                print(f"{'Linear':<12} {h['train']['mse_linear']:>10.6f}")
+                print(f"{'Mixed':<12} {h['train']['mse_mixed']:>10.6f}")
+                print(f"{'Special':<12} {h['train']['mse_special']:>10.6f}")
+                print(f"{'─'*60}")
+                print(f"Portfolio Sharpe (ann.)  train={h['train']['sharpe']:+.4f}  [full data]")
+            else:
+                print(f"{'Group':<12} {'Train MSE':>10} {'Val MSE':>10}")
+                print(f"{'─'*60}")
+                print(f"{'Linear':<12} {h['train']['mse_linear']:>10.6f} {h['val']['mse_linear']:>10.6f}")
+                print(f"{'Mixed':<12} {h['train']['mse_mixed']:>10.6f} {h['val']['mse_mixed']:>10.6f}")
+                print(f"{'Special':<12} {h['train']['mse_special']:>10.6f} {h['val']['mse_special']:>10.6f}")
+                print(f"{'─'*60}")
+                print(f"Portfolio Sharpe (ann.)  train={h['train']['sharpe']:+.4f}  val={h['val']['sharpe']:+.4f}")
             print(f"{'─'*60}\n")
 
     def predict_returns(self, x_df):
@@ -457,6 +477,7 @@ def main():
         lambda_linear=0.1,
         lambda_special=1000.0,
         poly_lambda=1000.0,
+        full_data=True,
         verbose=True,
     )
     submission = model.build_submission(data["X_train"], data["X_test"])
